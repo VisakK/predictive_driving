@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+runs/
+logs/
+models/
+wandb/
+.DS_Store
+.vscode/
+.idea/
+.predictive_driving/
