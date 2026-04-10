@@ -2,8 +2,9 @@ env_id: highway-v0
 algo: PPO
 policy: MlpPolicy
 seed: 42
-n_envs: 4
+n_envs: 12
 total_timesteps: 200000
+verbose: 1
 tb_dir: experiments/001_ppo_baseline/results/tb
 model_path: experiments/001_ppo_baseline/results/model
 algo_kwargs:
