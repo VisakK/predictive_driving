@@ -4,8 +4,10 @@ import gymnasium as gym
 import wandb
 from wandb.integration.sb3 import WandbCallback
 import highway_env  # noqa: F401 — registers envs
+import driving.envs  # noqa: F401 — registers custom envs
 from stable_baselines3 import PPO, SAC, DQN
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv
 import tqdm
 
 ALGOS = {"PPO": PPO, "SAC": SAC, "DQN": DQN}
@@ -13,13 +15,16 @@ ALGOS = {"PPO": PPO, "SAC": SAC, "DQN": DQN}
 
 def evaluate_and_log(model, env_id: str, n_episodes: int = 50,
                      n_video_episodes: int = 5, deterministic: bool = True,
-                     seed: int = 0) -> dict:
+                     seed: int = 0, env_config: dict | None = None) -> dict:
     """Run episodes, log aggregate stats + a few rendered videos to wandb.
 
     Returns a dict of summary metrics. The first `n_video_episodes` are
     recorded frame-by-frame and uploaded as wandb.Video to the active run.
     """
-    env = gym.make(env_id, render_mode="rgb_array")
+    make_kwargs = {"render_mode": "rgb_array"}
+    if env_config:
+        make_kwargs["config"] = env_config
+    env = gym.make(env_id, **make_kwargs)
 
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []
@@ -84,8 +89,11 @@ def run(config_path: str, run_name: str, smoke: bool = False):
                 sync_tensorboard=True,
                 monitor_gym=True,       # Auto-upload videos of the agent
                 save_code=True,)
+    env_config = cfg.get("env_config")
+    env_kwargs = {"config": env_config} if env_config else {}
     env = make_vec_env(cfg["env_id"], n_envs=cfg.get("n_envs", 1),
-                       seed=cfg["seed"])
+                       seed=cfg["seed"], env_kwargs=env_kwargs,
+                       vec_env_cls=SubprocVecEnv)
     AlgoCls = ALGOS[cfg["algo"]]
     algo_kwargs = dict(cfg.get("algo_kwargs", {}))
     timesteps = 1_000 if smoke else cfg["total_timesteps"]
@@ -103,9 +111,10 @@ def run(config_path: str, run_name: str, smoke: bool = False):
     metrics = evaluate_and_log(
         model,
         cfg["env_id"],
-        n_episodes=cfg.get("eval_episodes", 50),
-        n_video_episodes=cfg.get("eval_video_episodes", 5),
+        n_episodes=3 if smoke else cfg.get("eval_episodes", 50),
+        n_video_episodes=1 if smoke else cfg.get("eval_video_episodes", 5),
         seed=cfg["seed"] + 10_000,
+        env_config=env_config,
     )
     return metrics
 
