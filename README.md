@@ -7,12 +7,5 @@ This project explores the idea of learning a robust autonomous driving policy th
 
 ### Videos
 
-<p align="center">
-  <video src="./assets/highway_1.mp4" controls width="720">Your browser does not support the video tag.</video>
-  <br><em>Highway scenario</em>
-</p>
-
-<p align="center">
-  <video src="./assets/roundabout_1.mp4" controls width="720">Your browser does not support the video tag.</video>
-  <br><em>Roundabout scenario</em>
-</p>
+- [Highway scenario video](./assets/highway_1.mp4)
+- [Roundabout scenario video](./assets/roundabout_1.mp4)
