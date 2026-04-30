@@ -214,6 +214,105 @@ class Discriminator(nn.Module):
         return loss, acc.item()
 
 
+class KinematicsHistoryEncoder(nn.Module):
+    """MLP encoder for (N_agents, N_frames, feat_dim) per-agent temporal kinematics."""
+
+    def __init__(
+        self,
+        n_agents: int,
+        n_frames: int,
+        feat_dim: int,
+        hidden_dim: int = 128,
+        out_dim: int = 64,
+    ):
+        super().__init__()
+        in_dim = n_agents * n_frames * feat_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, kin_history: torch.Tensor) -> torch.Tensor:
+        return self.net(kin_history.flatten(1))
+
+
+class AgentAnomalyEncoder(nn.Module):
+    """MLP encoder for per-agent causal anomaly features."""
+
+    def __init__(
+        self,
+        n_agents: int,
+        anomaly_feat_dim: int,
+        hidden_dim: int = 64,
+        out_dim: int = 32,
+    ):
+        super().__init__()
+        in_dim = n_agents * anomaly_feat_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, anomaly_features: torch.Tensor) -> torch.Tensor:
+        return self.net(anomaly_features.flatten(1))
+
+
+class OnlineKinematicsPredictor(nn.Module):
+    """Predicts current agent kinematics from prior history frames."""
+
+    def __init__(
+        self,
+        n_agents: int,
+        n_history_frames: int,
+        agent_feat_dim: int,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        self.n_agents = n_agents
+        self.agent_feat_dim = agent_feat_dim
+        self.net = nn.Sequential(
+            nn.Linear(n_agents * (n_history_frames - 1) * agent_feat_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_agents * agent_feat_dim),
+        )
+
+    def forward(self, kin_history: torch.Tensor) -> torch.Tensor:
+        prior = kin_history[:, :, :-1, :]
+        pred = self.net(prior.flatten(1))
+        return pred.reshape(-1, self.n_agents, self.agent_feat_dim)
+
+    def loss(self, kin_history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pred = self.forward(kin_history)
+        target = kin_history[:, :, -1, :]
+        presence = target[:, :, 0:1].clamp(min=0)
+        err = F.mse_loss(pred, target, reduction="none")
+        loss = (err * presence).sum() / presence.sum().clamp(min=1)
+        return loss, pred
+
+    @staticmethod
+    def anomaly_from_prediction(
+        pred: torch.Tensor,
+        current: torch.Tensor,
+    ) -> torch.Tensor:
+        presence = current[:, :, 0]
+        pos_err = torch.linalg.norm(current[:, :, 1:3] - pred[:, :, 1:3], dim=-1)
+        vel_err = torch.linalg.norm(current[:, :, 3:5] - pred[:, :, 3:5], dim=-1)
+        heading_err = torch.linalg.norm(current[:, :, 5:7] - pred[:, :, 5:7], dim=-1)
+        raw = pos_err + 0.5 * vel_err + 0.25 * heading_err
+        anomaly = torch.clamp(raw / 0.35, 0.0, 1.0) * presence
+        distance = torch.sqrt(current[:, :, 1] ** 2 + current[:, :, 2] ** 2 + 1e-8)
+        proximity = torch.clamp(1.0 - distance, min=0.0, max=1.0)
+        closing = torch.clamp(-current[:, :, 3], min=0.0, max=1.0)
+        risk = anomaly * (0.5 + 0.5 * proximity) * (0.5 + 0.5 * closing)
+        return torch.stack([presence, anomaly, risk, torch.clamp(raw, 0.0, 1.0)], dim=-1)
+
+
 class ViTCVAEExtractor(BaseFeaturesExtractor):
     """SB3 feature extractor: ViT + CVAE + Discriminator for adversarial PPO."""
 
@@ -229,8 +328,35 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
         cvae_latent_dim: int = 32,
         cvae_hidden_dim: int = 128,
         disc_hidden_dim: int = 128,
+        use_kinematics_policy: bool = False,
+        n_history_frames: int = 10,
+        kin_encoder_hidden: int = 128,
+        kin_encoder_out: int = 64,
+        use_anomaly_policy: bool = False,
+        anomaly_encoder_hidden: int = 64,
+        anomaly_encoder_out: int = 32,
+        use_online_predictor: bool = False,
+        use_learned_anomaly_policy: bool = False,
+        predictor_hidden_dim: int = 128,
     ):
-        super().__init__(observation_space, features_dim)
+        self.use_kinematics_policy = use_kinematics_policy and (
+            "agent_kin_history" in observation_space.spaces
+        )
+        self.use_anomaly_policy = use_anomaly_policy and (
+            "agent_anomaly" in observation_space.spaces
+        )
+        self.use_online_predictor = use_online_predictor and (
+            "agent_kin_history" in observation_space.spaces
+        )
+        self.use_learned_anomaly_policy = (
+            use_learned_anomaly_policy and self.use_online_predictor
+        )
+        actual_features_dim = vit_embed_dim
+        if self.use_kinematics_policy:
+            actual_features_dim += kin_encoder_out
+        if self.use_anomaly_policy or self.use_learned_anomaly_policy:
+            actual_features_dim += anomaly_encoder_out
+        super().__init__(observation_space, actual_features_dim)
 
         grid_space = observation_space["occupancy_grid"]
         n_channels, grid_h, grid_w = grid_space.shape
@@ -258,13 +384,57 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
             hidden_dim=disc_hidden_dim,
         )
 
+        if self.use_kinematics_policy:
+            self.kin_encoder = KinematicsHistoryEncoder(
+                n_agents=n_agents,
+                n_frames=n_history_frames,
+                feat_dim=agent_feat_dim,
+                hidden_dim=kin_encoder_hidden,
+                out_dim=kin_encoder_out,
+            )
+
+        if self.use_anomaly_policy or self.use_learned_anomaly_policy:
+            if self.use_anomaly_policy:
+                anomaly_feat_dim = observation_space["agent_anomaly"].shape[-1]
+            else:
+                anomaly_feat_dim = 4
+            self.anomaly_encoder = AgentAnomalyEncoder(
+                n_agents=n_agents,
+                anomaly_feat_dim=anomaly_feat_dim,
+                hidden_dim=anomaly_encoder_hidden,
+                out_dim=anomaly_encoder_out,
+            )
+
+        if self.use_online_predictor:
+            self.online_predictor = OnlineKinematicsPredictor(
+                n_agents=n_agents,
+                n_history_frames=n_history_frames,
+                agent_feat_dim=agent_feat_dim,
+                hidden_dim=predictor_hidden_dim,
+            )
+
         self._cached_scene_embed: torch.Tensor | None = None
 
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
         grid = observations["occupancy_grid"].float()
         scene_embed = self.vit(grid)
         self._cached_scene_embed = scene_embed
-        return scene_embed
+        features = [scene_embed]
+        if self.use_kinematics_policy:
+            kin_hist = observations["agent_kin_history"].float()
+            kin_embed = self.kin_encoder(kin_hist)
+            features.append(kin_embed)
+        if self.use_anomaly_policy:
+            anomaly = observations["agent_anomaly"].float()
+            features.append(self.anomaly_encoder(anomaly))
+        elif self.use_learned_anomaly_policy:
+            kin_hist = observations["agent_kin_history"].float()
+            current = observations["agent_kinematics"].float()
+            with torch.no_grad():
+                pred = self.online_predictor(kin_hist)
+                anomaly = self.online_predictor.anomaly_from_prediction(pred, current)
+            features.append(self.anomaly_encoder(anomaly))
+        return torch.cat(features, dim=1)
 
     def compute_auxiliary_losses(
         self, observations: dict[str, torch.Tensor]
@@ -292,10 +462,47 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
             "disc_accuracy": disc_acc,
         }
 
+    def compute_predictor_loss(
+        self, observations: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor | float]:
+        if not self.use_online_predictor:
+            zero = torch.zeros((), device=observations["occupancy_grid"].device)
+            return {"predictor_loss": zero, "predictor_mean_anomaly": 0.0}
+        kin_hist = observations["agent_kin_history"].float()
+        current = observations["agent_kinematics"].float()
+        loss, pred = self.online_predictor.loss(kin_hist)
+        with torch.no_grad():
+            anomaly = self.online_predictor.anomaly_from_prediction(pred, current)
+            presence = anomaly[:, :, 0]
+            mean_anomaly = (
+                anomaly[:, :, 1] * presence
+            ).sum() / presence.sum().clamp(min=1)
+        return {
+            "predictor_loss": loss,
+            "predictor_mean_anomaly": float(mean_anomaly.item()),
+        }
+
     def compute_anomaly_scores(
         self, observations: dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """Per-env anomaly score for reward shaping (higher = more anomalous)."""
+        if self.use_learned_anomaly_policy and "agent_kin_history" in observations:
+            kin_hist = observations["agent_kin_history"].float()
+            current = observations["agent_kinematics"].float()
+            pred = self.online_predictor(kin_hist)
+            anomaly_features = self.online_predictor.anomaly_from_prediction(
+                pred, current
+            )
+            presence = anomaly_features[:, :, 0]
+            risk = anomaly_features[:, :, 2]
+            return (risk * presence).sum(1) / presence.sum(1).clamp(min=1)
+
+        if "agent_anomaly" in observations:
+            anomaly_features = observations["agent_anomaly"].float()
+            presence = anomaly_features[:, :, 0]
+            risk = anomaly_features[:, :, 2]
+            return (risk * presence).sum(1) / presence.sum(1).clamp(min=1)
+
         grid = observations["occupancy_grid"].float()
         agent_kin = observations["agent_kinematics"].float()
 

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import gymnasium as gym
+import imageio.v2 as imageio
 import numpy as np
 import torch
 import tqdm
@@ -33,12 +34,16 @@ def evaluate_adversarial(
     deterministic: bool = True,
     seed: int = 0,
     env_config: dict | None = None,
+    video_dir: str | Path | None = None,
 ) -> dict:
     """Evaluate with adversarial-specific metrics."""
-    make_kwargs = {"render_mode": "rgb_array"}
+    make_kwargs = {"render_mode": "rgb_array"} if n_video_episodes > 0 else {}
     if env_config:
         make_kwargs["config"] = env_config
     env = gym.make(env_id, **make_kwargs)
+    video_path = Path(video_dir) if video_dir is not None else None
+    if video_path is not None:
+        video_path.mkdir(parents=True, exist_ok=True)
 
     episode_rewards: list[float] = []
     episode_lengths: list[int] = []
@@ -84,9 +89,17 @@ def evaluate_adversarial(
                 .transpose(0, 3, 1, 2)
                 .astype(np.uint8)
             )
-            wandb.log(
-                {f"eval/video_ep_{ep}": wandb.Video(video, fps=10, format="mp4")}
-            )
+            if video_path is not None:
+                imageio.mimsave(
+                    video_path / f"eval_video_ep_{ep}.mp4",
+                    frames,
+                    fps=10,
+                )
+            run = getattr(wandb, "run", None)
+            if run is not None and not getattr(run, "disabled", False):
+                wandb.log(
+                    {f"eval/video_ep_{ep}": wandb.Video(video, fps=10, format="mp4")}
+                )
 
     env.close()
 
@@ -129,12 +142,16 @@ def run(config_path: str, run_name: str, smoke: bool = False):
     env_kwargs = {"config": env_config} if env_config else {}
     n_envs = 1 if smoke else cfg.get("n_envs", 4)
     vec_cls = None if smoke else SubprocVecEnv
+    vec_env_kwargs = {}
+    if vec_cls is not None and cfg.get("vec_env_start_method"):
+        vec_env_kwargs["start_method"] = cfg["vec_env_start_method"]
     env = make_vec_env(
         cfg["env_id"],
         n_envs=n_envs,
         seed=cfg["seed"],
         env_kwargs=env_kwargs,
         vec_env_cls=vec_cls,
+        vec_env_kwargs=vec_env_kwargs,
     )
 
     n_channels = len(env_config.get("observation", {}).get("features", []))
@@ -155,6 +172,18 @@ def run(config_path: str, run_name: str, smoke: bool = False):
             "cvae_latent_dim": adv_cfg.get("cvae_latent_dim", 32),
             "cvae_hidden_dim": adv_cfg.get("cvae_hidden_dim", 128),
             "disc_hidden_dim": adv_cfg.get("disc_hidden_dim", 128),
+            "use_kinematics_policy": adv_cfg.get("use_kinematics_policy", False),
+            "n_history_frames": adv_cfg.get("n_history_frames", 10),
+            "kin_encoder_hidden": adv_cfg.get("kin_encoder_hidden", 128),
+            "kin_encoder_out": adv_cfg.get("kin_encoder_out", 64),
+            "use_anomaly_policy": adv_cfg.get("use_anomaly_policy", False),
+            "anomaly_encoder_hidden": adv_cfg.get("anomaly_encoder_hidden", 64),
+            "anomaly_encoder_out": adv_cfg.get("anomaly_encoder_out", 32),
+            "use_online_predictor": adv_cfg.get("use_online_predictor", False),
+            "use_learned_anomaly_policy": adv_cfg.get(
+                "use_learned_anomaly_policy", False
+            ),
+            "predictor_hidden_dim": adv_cfg.get("predictor_hidden_dim", 128),
         },
         "net_arch": dict(pi=[128, 128], vf=[128, 128]),
     }
@@ -171,6 +200,7 @@ def run(config_path: str, run_name: str, smoke: bool = False):
         alpha=adv_cfg.get("alpha", 0.1),
         beta=adv_cfg.get("beta", 0.1),
         anomaly_reward_weight=adv_cfg.get("anomaly_reward_weight", 0.5),
+        predictor_loss_weight=adv_cfg.get("predictor_loss_weight", 0.0),
         seed=cfg["seed"],
         tensorboard_log=cfg["tb_dir"],
         verbose=cfg.get("verbose", 1),
@@ -189,17 +219,23 @@ def run(config_path: str, run_name: str, smoke: bool = False):
     )
     model.save(cfg["model_path"])
 
-    metrics = evaluate_adversarial(
-        model,
-        cfg["env_id"],
-        n_episodes=3 if smoke else cfg.get("eval_episodes", 50),
-        n_video_episodes=1 if smoke else cfg.get("eval_video_episodes", 5),
-        seed=cfg["seed"] + 10_000,
-        env_config=env_config,
-    )
-
     results_dir = Path(cfg["model_path"]).parent
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    eval_episodes = 0 if smoke else cfg.get("eval_episodes", 50)
+    if eval_episodes > 0:
+        metrics = evaluate_adversarial(
+            model,
+            cfg["env_id"],
+            n_episodes=eval_episodes,
+            n_video_episodes=0 if smoke else cfg.get("eval_video_episodes", 5),
+            seed=cfg["seed"] + 10_000,
+            env_config=env_config,
+            video_dir=results_dir / "videos",
+        )
+    else:
+        metrics = {"eval/skipped": 1.0}
+
     summary_path = results_dir / "summary.md"
     with open(summary_path, "w") as f:
         f.write(f"# {run_name}\n\n")
@@ -210,6 +246,11 @@ def run(config_path: str, run_name: str, smoke: bool = False):
         f.write(f"- Alpha (CVAE): {adv_cfg.get('alpha', 0.1)}\n")
         f.write(f"- Beta (Disc): {adv_cfg.get('beta', 0.1)}\n")
         f.write(f"- Anomaly reward weight: {adv_cfg.get('anomaly_reward_weight', 0.5)}\n\n")
+        f.write(f"- Predictor loss weight: {adv_cfg.get('predictor_loss_weight', 0.0)}\n")
+        f.write(f"- Anomaly policy input: {adv_cfg.get('use_anomaly_policy', False)}\n")
+        f.write(f"- Learned anomaly policy input: {adv_cfg.get('use_learned_anomaly_policy', False)}\n\n")
+        if eval_episodes > 0 and cfg.get("eval_video_episodes", 5) > 0:
+            f.write(f"- Local eval videos: {results_dir / 'videos'}\n\n")
         f.write(f"## Results\n")
         for k, v in sorted(metrics.items()):
             f.write(f"- {k}: {v:.4f}\n")

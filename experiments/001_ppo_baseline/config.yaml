@@ -3,10 +3,26 @@ algo: PPO
 policy: MlpPolicy
 seed: 42
 n_envs: 12
-total_timesteps: 200000
+total_timesteps: 300000
 verbose: 1
 tb_dir: experiments/001_ppo_baseline/results/tb
 model_path: experiments/001_ppo_baseline/results/model
+eval_episodes: 50
+eval_video_episodes: 5
+env_config:
+  simulation_frequency: 5
+  policy_frequency: 1
+  observation:
+    type: Kinematics
+    vehicles_count: 15
+    features: [presence, x, y, vx, vy, cos_h, sin_h]
+    features_range:
+      x: [-100, 100]
+      y: [-100, 100]
+      vx: [-20, 20]
+      vy: [-20, 20]
+    absolute: false
+    order: sorted
 algo_kwargs:
   learning_rate: 0.0003
   batch_size: 64

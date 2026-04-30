@@ -17,6 +17,18 @@ from stable_baselines3.common.vec_env import VecEnv
 from driving.vit_cvae import ViTCVAEExtractor
 
 
+def _component_grad_norm(
+    component_loss: th.Tensor, params: list, optimizer
+) -> float:
+    optimizer.zero_grad()
+    component_loss.backward(retain_graph=True)
+    total_sq = 0.0
+    for p in params:
+        if p.grad is not None:
+            total_sq += float(p.grad.detach().pow(2).sum().item())
+    return total_sq ** 0.5
+
+
 class AdversarialPPO(PPO):
     """PPO with joint CVAE + Discriminator training and anomaly-shaped reward."""
 
@@ -27,11 +39,13 @@ class AdversarialPPO(PPO):
         alpha: float = 0.1,
         beta: float = 0.1,
         anomaly_reward_weight: float = 0.5,
+        predictor_loss_weight: float = 0.0,
         **kwargs,
     ):
         self.alpha = alpha
         self.beta = beta
         self.anomaly_reward_weight = anomaly_reward_weight
+        self.predictor_loss_weight = predictor_loss_weight
         super().__init__(policy, env, **kwargs)
 
     def _get_extractor(self) -> ViTCVAEExtractor:
@@ -142,7 +156,12 @@ class AdversarialPPO(PPO):
 
         entropy_losses, pg_losses, value_losses = [], [], []
         cvae_losses, disc_losses, disc_accs = [], [], []
+        predictor_losses, predictor_anomalies = [], []
         clip_fractions = []
+        grad_norm_ppo_last: float | None = None
+        grad_norm_cvae_last: float | None = None
+        grad_norm_disc_last: float | None = None
+        grad_norm_logged = False
 
         continue_training = True
         for epoch in range(self.n_epochs):
@@ -199,16 +218,36 @@ class AdversarialPPO(PPO):
                     + self.vf_coef * value_loss
                 )
 
-                # Joint auxiliary losses
+                # Joint auxiliary losses. Skip disabled branches so pure policy
+                # ablations do not spend compute training unused heads.
                 extractor = self._get_extractor()
-                aux = extractor.compute_auxiliary_losses(rollout_data.observations)
-                cvae_loss = aux["cvae_loss"]
-                disc_loss = aux["disc_loss"]
-                cvae_losses.append(cvae_loss.item())
-                disc_losses.append(disc_loss.item())
-                disc_accs.append(aux["disc_accuracy"])
+                zero = th.zeros((), device=self.device)
+                cvae_loss = zero
+                disc_loss = zero
+                predictor_loss = zero
 
-                loss = ppo_loss + self.alpha * cvae_loss + self.beta * disc_loss
+                if self.alpha > 0 or self.beta > 0:
+                    aux = extractor.compute_auxiliary_losses(rollout_data.observations)
+                    cvae_loss = aux["cvae_loss"]
+                    disc_loss = aux["disc_loss"]
+                    cvae_losses.append(cvae_loss.item())
+                    disc_losses.append(disc_loss.item())
+                    disc_accs.append(aux["disc_accuracy"])
+
+                if self.predictor_loss_weight > 0:
+                    pred_aux = extractor.compute_predictor_loss(
+                        rollout_data.observations
+                    )
+                    predictor_loss = pred_aux["predictor_loss"]
+                    predictor_losses.append(predictor_loss.item())
+                    predictor_anomalies.append(pred_aux["predictor_mean_anomaly"])
+
+                loss = (
+                    ppo_loss
+                    + self.alpha * cvae_loss
+                    + self.beta * disc_loss
+                    + self.predictor_loss_weight * predictor_loss
+                )
 
                 with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob
@@ -228,6 +267,23 @@ class AdversarialPPO(PPO):
                             f"reaching max kl: {approx_kl_div:.2f}"
                         )
                     break
+
+                # Gradient-norm diagnostic: once per train() call, measure the
+                # contribution of each loss term to the ViT gradient separately.
+                # This surfaces whether aux losses dominate PPO through the
+                # shared encoder, independent of their raw loss magnitudes.
+                if not grad_norm_logged and (self.alpha > 0 or self.beta > 0):
+                    vit_params = list(extractor.vit.parameters())
+                    grad_norm_ppo_last = _component_grad_norm(
+                        ppo_loss, vit_params, self.policy.optimizer
+                    )
+                    grad_norm_cvae_last = _component_grad_norm(
+                        self.alpha * cvae_loss, vit_params, self.policy.optimizer
+                    )
+                    grad_norm_disc_last = _component_grad_norm(
+                        self.beta * disc_loss, vit_params, self.policy.optimizer
+                    )
+                    grad_norm_logged = True
 
                 self.policy.optimizer.zero_grad()
                 loss.backward()
@@ -252,9 +308,21 @@ class AdversarialPPO(PPO):
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
-        self.logger.record("train/cvae_loss", np.mean(cvae_losses))
-        self.logger.record("train/disc_loss", np.mean(disc_losses))
-        self.logger.record("train/disc_accuracy", np.mean(disc_accs))
+        if cvae_losses:
+            self.logger.record("train/cvae_loss", np.mean(cvae_losses))
+        if disc_losses:
+            self.logger.record("train/disc_loss", np.mean(disc_losses))
+        if disc_accs:
+            self.logger.record("train/disc_accuracy", np.mean(disc_accs))
+        if predictor_losses:
+            self.logger.record("train/predictor_loss", np.mean(predictor_losses))
+            self.logger.record(
+                "train/predictor_mean_anomaly", np.mean(predictor_anomalies)
+            )
+        if grad_norm_ppo_last is not None:
+            self.logger.record("train/grad_norm_ppo_at_vit", grad_norm_ppo_last)
+            self.logger.record("train/grad_norm_cvae_at_vit", grad_norm_cvae_last)
+            self.logger.record("train/grad_norm_disc_at_vit", grad_norm_disc_last)
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
