@@ -10,3 +10,4 @@ wandb/
 .vscode/
 .idea/
 .predictive_driving/
+experiments/

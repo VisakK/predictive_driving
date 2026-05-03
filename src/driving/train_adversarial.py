@@ -17,6 +17,7 @@ from wandb.integration.sb3 import WandbCallback
 import highway_env  # noqa: F401
 import driving.envs  # noqa: F401
 import driving.adversarial  # noqa: F401 — registers adversarial envs
+import driving.adversarial_v3  # noqa: F401 — registers v3 archetype envs
 
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
@@ -184,6 +185,17 @@ def run(config_path: str, run_name: str, smoke: bool = False):
                 "use_learned_anomaly_policy", False
             ),
             "predictor_hidden_dim": adv_cfg.get("predictor_hidden_dim", 128),
+            "use_anomaly_attention_policy": adv_cfg.get(
+                "use_anomaly_attention_policy", False
+            ),
+            "anomaly_attn_embed_dim": adv_cfg.get("anomaly_attn_embed_dim", 64),
+            "anomaly_attn_n_heads": adv_cfg.get("anomaly_attn_n_heads", 4),
+            "anomaly_attn_spatial_sigma": adv_cfg.get(
+                "anomaly_attn_spatial_sigma", 1.5
+            ),
+            "anomaly_attn_use_risk_bias": adv_cfg.get(
+                "anomaly_attn_use_risk_bias", False
+            ),
         },
         "net_arch": dict(pi=[128, 128], vf=[128, 128]),
     }

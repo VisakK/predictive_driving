@@ -53,12 +53,13 @@ class ViTEncoder(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def forward(self, grid: torch.Tensor) -> torch.Tensor:
+    def forward(self, grid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             grid: (batch, C, H, W)
         Returns:
-            (batch, embed_dim) CLS token embedding
+            cls: (batch, embed_dim) CLS token embedding
+            patches: (batch, H*W, embed_dim) patch token embeddings
         """
         B = grid.shape[0]
         x = grid.flatten(2).transpose(1, 2)  # (B, H*W, C)
@@ -69,7 +70,8 @@ class ViTEncoder(nn.Module):
         x = x + self.pos_embed
 
         x = self.encoder(x)
-        return self.norm(x[:, 0])
+        x = self.norm(x)
+        return x[:, 0], x[:, 1:]
 
 
 class CVAE(nn.Module):
@@ -313,6 +315,199 @@ class OnlineKinematicsPredictor(nn.Module):
         return torch.stack([presence, anomaly, risk, torch.clamp(raw, 0.0, 1.0)], dim=-1)
 
 
+class _RiskTemperatureCrossAttn(nn.Module):
+    """Multi-head cross-attention with per-query multiplicative scaling on
+    attention logits. Used to inject per-agent risk/anomaly directly into
+    the attention dynamics so the gradient cannot route around the anomaly
+    channels (053 design)."""
+
+    def __init__(self, embed_dim: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert embed_dim % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = embed_dim // n_heads
+        self.embed_dim = embed_dim
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        for proj in (self.q_proj, self.k_proj, self.v_proj, self.out_proj):
+            nn.init.xavier_uniform_(proj.weight)
+            nn.init.zeros_(proj.bias)
+
+    def forward(
+        self,
+        q: torch.Tensor,           # (B, N, D)
+        kv: torch.Tensor,          # (B, S, D)
+        attn_bias: torch.Tensor | None = None,   # (B, N, S) additive
+        q_scale: torch.Tensor | None = None,     # (B, N) multiplicative on logits
+    ) -> torch.Tensor:
+        B, N, D = q.shape
+        S = kv.shape[1]
+        H = self.n_heads
+        Dh = self.head_dim
+
+        Q = self.q_proj(q).reshape(B, N, H, Dh).transpose(1, 2)
+        K = self.k_proj(kv).reshape(B, S, H, Dh).transpose(1, 2)
+        V = self.v_proj(kv).reshape(B, S, H, Dh).transpose(1, 2)
+
+        logits = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(Dh)  # (B, H, N, S)
+        if attn_bias is not None:
+            logits = logits + attn_bias.unsqueeze(1)
+        if q_scale is not None:
+            logits = logits * q_scale.unsqueeze(1).unsqueeze(-1)
+
+        attn = F.softmax(logits, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = torch.matmul(attn, V).transpose(1, 2).reshape(B, N, D)
+        return self.out_proj(out)
+
+
+class AnomalyAttentionEncoder(nn.Module):
+    """Per-agent self-attention + cross-attention to ViT scene tokens.
+
+    Replaces the flat-MLP `AgentAnomalyEncoder` for the H10 anomaly path.
+    See AnomalyInputDesign.md for the full design.
+
+    When ``use_risk_attention_bias`` is set, the cross-attention is replaced
+    with a custom implementation that scales each agent-query's attention
+    logits by ``temp_i = 1 + softplus(s_a) * anomaly_i + softplus(s_r) * risk_i``,
+    forcing a gradient pathway through the anomaly channels (053 design).
+    """
+
+    def __init__(
+        self,
+        n_agents: int = 15,
+        kin_feat_dim: int = 7,
+        anomaly_feat_dim: int = 4,
+        scene_dim: int = 64,
+        embed_dim: int = 64,
+        n_heads: int = 4,
+        ffn_ratio: int = 2,
+        dropout: float = 0.1,
+        spatial_sigma: float = 1.5,
+        grid_h: int = 11,
+        grid_w: int = 11,
+        use_risk_attention_bias: bool = False,
+    ):
+        super().__init__()
+        self.n_agents = n_agents
+        self.embed_dim = embed_dim
+        self.spatial_sigma = spatial_sigma
+        self.grid_h = grid_h
+        self.grid_w = grid_w
+        self.use_risk_attention_bias = use_risk_attention_bias
+
+        self.token_proj = nn.Linear(kin_feat_dim + anomaly_feat_dim, embed_dim)
+        self.slot_pos_emb = nn.Parameter(torch.zeros(1, n_agents, embed_dim))
+
+        self_attn_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=n_heads,
+            dim_feedforward=embed_dim * ffn_ratio,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.agent_self_attn = nn.TransformerEncoder(self_attn_layer, num_layers=1)
+
+        self.scene_proj = (
+            nn.Linear(scene_dim, embed_dim) if scene_dim != embed_dim else nn.Identity()
+        )
+        self.cross_pre_norm_q = nn.LayerNorm(embed_dim)
+        self.cross_pre_norm_kv = nn.LayerNorm(embed_dim)
+        if self.use_risk_attention_bias:
+            self.agent_to_scene = _RiskTemperatureCrossAttn(
+                embed_dim=embed_dim, n_heads=n_heads, dropout=dropout,
+            )
+            # softplus(0) = ln(2) ≈ 0.69 → max scale at init ≈ 1 + 0.69 + 0.69 = 2.38
+            self.s_anomaly = nn.Parameter(torch.zeros(1))
+            self.s_risk = nn.Parameter(torch.zeros(1))
+        else:
+            self.agent_to_scene = nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=n_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+        self.cross_ffn_norm = nn.LayerNorm(embed_dim)
+        self.cross_ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * ffn_ratio),
+            nn.GELU(),
+            nn.Linear(embed_dim * ffn_ratio, embed_dim),
+        )
+
+        # patch centers in normalized [-1, 1] for spatial bias.
+        ys = torch.linspace(-1.0, 1.0, grid_h)
+        xs = torch.linspace(-1.0, 1.0, grid_w)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        patch_xy = torch.stack([gx, gy], dim=-1).reshape(-1, 2)  # (H*W, 2)
+        self.register_buffer("patch_xy", patch_xy, persistent=False)
+
+        nn.init.trunc_normal_(self.slot_pos_emb, std=0.02)
+
+    def _spatial_bias(self, agent_xy: torch.Tensor) -> torch.Tensor:
+        """Log-Gaussian additive bias on attention logits. -inf for absent slots
+        is applied later via key_padding_mask, not here."""
+        # agent_xy: (B, N, 2) in normalized coords
+        diff = agent_xy.unsqueeze(2) - self.patch_xy.unsqueeze(0).unsqueeze(0)
+        d2 = diff.pow(2).sum(-1)  # (B, N, H*W)
+        return -d2 / (2.0 * self.spatial_sigma ** 2)
+
+    def forward(
+        self,
+        agent_kin: torch.Tensor,        # (B, N, kin_feat_dim)
+        agent_anom: torch.Tensor,       # (B, N, anomaly_feat_dim)
+        scene_patches: torch.Tensor,    # (B, H*W, scene_dim)
+    ) -> torch.Tensor:
+        B, N, _ = agent_kin.shape
+        presence = agent_kin[:, :, 0]                  # (B, N)
+        pad_mask = presence < 0.5                      # True = ignore
+
+        token_in = torch.cat([agent_kin, agent_anom], dim=-1)
+        agent_tokens = self.token_proj(token_in) + self.slot_pos_emb
+
+        # Stage B — agent self-attention.
+        agent_tokens = self.agent_self_attn(
+            agent_tokens, src_key_padding_mask=pad_mask
+        )
+
+        # Stage C — agent-as-query cross-attention to ViT patches.
+        agent_xy = agent_kin[:, :, 1:3]                # (B, N, 2)
+        spatial_bias = self._spatial_bias(agent_xy)    # (B, N, H*W)
+
+        q = self.cross_pre_norm_q(agent_tokens)
+        kv = self.cross_pre_norm_kv(self.scene_proj(scene_patches))
+
+        if self.use_risk_attention_bias:
+            anomaly_scalar = agent_anom[:, :, 1]       # (B, N)
+            risk_scalar = agent_anom[:, :, 2]          # (B, N)
+            q_scale = (
+                1.0
+                + F.softplus(self.s_anomaly) * anomaly_scalar
+                + F.softplus(self.s_risk) * risk_scalar
+            )
+            attn_out = self.agent_to_scene(
+                q, kv, attn_bias=spatial_bias, q_scale=q_scale,
+            )
+        else:
+            n_heads = self.agent_to_scene.num_heads
+            attn_mask = (
+                spatial_bias.unsqueeze(1)
+                .expand(-1, n_heads, -1, -1)
+                .reshape(B * n_heads, N, -1)
+            )
+            attn_out, _ = self.agent_to_scene(q, kv, kv, attn_mask=attn_mask)
+        agent_tokens = agent_tokens + attn_out
+        agent_tokens = agent_tokens + self.cross_ffn(self.cross_ffn_norm(agent_tokens))
+
+        # Stage D — presence-weighted pool. Zero out padded slots first.
+        weights = presence.unsqueeze(-1)               # (B, N, 1)
+        pooled = (agent_tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+        return pooled
+
+
 class ViTCVAEExtractor(BaseFeaturesExtractor):
     """SB3 feature extractor: ViT + CVAE + Discriminator for adversarial PPO."""
 
@@ -338,24 +533,40 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
         use_online_predictor: bool = False,
         use_learned_anomaly_policy: bool = False,
         predictor_hidden_dim: int = 128,
+        use_anomaly_attention_policy: bool = False,
+        anomaly_attn_embed_dim: int = 64,
+        anomaly_attn_n_heads: int = 4,
+        anomaly_attn_spatial_sigma: float = 1.5,
+        anomaly_attn_use_risk_bias: bool = False,
     ):
         self.use_kinematics_policy = use_kinematics_policy and (
             "agent_kin_history" in observation_space.spaces
         )
-        self.use_anomaly_policy = use_anomaly_policy and (
+        self.use_anomaly_attention_policy = use_anomaly_attention_policy and (
             "agent_anomaly" in observation_space.spaces
+            and "agent_kinematics" in observation_space.spaces
+        )
+        # Attention policy supersedes the flat-MLP anomaly path.
+        self.use_anomaly_policy = (
+            use_anomaly_policy
+            and not self.use_anomaly_attention_policy
+            and ("agent_anomaly" in observation_space.spaces)
         )
         self.use_online_predictor = use_online_predictor and (
             "agent_kin_history" in observation_space.spaces
         )
         self.use_learned_anomaly_policy = (
-            use_learned_anomaly_policy and self.use_online_predictor
+            use_learned_anomaly_policy
+            and self.use_online_predictor
+            and not self.use_anomaly_attention_policy
         )
         actual_features_dim = vit_embed_dim
         if self.use_kinematics_policy:
             actual_features_dim += kin_encoder_out
         if self.use_anomaly_policy or self.use_learned_anomaly_policy:
             actual_features_dim += anomaly_encoder_out
+        if self.use_anomaly_attention_policy:
+            actual_features_dim += anomaly_attn_embed_dim
         super().__init__(observation_space, actual_features_dim)
 
         grid_space = observation_space["occupancy_grid"]
@@ -413,18 +624,40 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
                 hidden_dim=predictor_hidden_dim,
             )
 
+        if self.use_anomaly_attention_policy:
+            anom_dim = observation_space["agent_anomaly"].shape[-1]
+            kin_dim = observation_space["agent_kinematics"].shape[-1]
+            self.anomaly_attn_encoder = AnomalyAttentionEncoder(
+                n_agents=n_agents,
+                kin_feat_dim=kin_dim,
+                anomaly_feat_dim=anom_dim,
+                scene_dim=vit_embed_dim,
+                embed_dim=anomaly_attn_embed_dim,
+                n_heads=anomaly_attn_n_heads,
+                spatial_sigma=anomaly_attn_spatial_sigma,
+                grid_h=grid_h,
+                grid_w=grid_w,
+                use_risk_attention_bias=anomaly_attn_use_risk_bias,
+            )
+
         self._cached_scene_embed: torch.Tensor | None = None
 
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
         grid = observations["occupancy_grid"].float()
-        scene_embed = self.vit(grid)
+        scene_embed, scene_patches = self.vit(grid)
         self._cached_scene_embed = scene_embed
         features = [scene_embed]
         if self.use_kinematics_policy:
             kin_hist = observations["agent_kin_history"].float()
             kin_embed = self.kin_encoder(kin_hist)
             features.append(kin_embed)
-        if self.use_anomaly_policy:
+        if self.use_anomaly_attention_policy:
+            agent_kin = observations["agent_kinematics"].float()
+            agent_anom = observations["agent_anomaly"].float()
+            features.append(
+                self.anomaly_attn_encoder(agent_kin, agent_anom, scene_patches)
+            )
+        elif self.use_anomaly_policy:
             anomaly = observations["agent_anomaly"].float()
             features.append(self.anomaly_encoder(anomaly))
         elif self.use_learned_anomaly_policy:
@@ -442,7 +675,7 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
         scene_embed = self._cached_scene_embed
         if scene_embed is None:
             grid = observations["occupancy_grid"].float()
-            scene_embed = self.vit(grid)
+            scene_embed, _ = self.vit(grid)
 
         agent_kin = observations["agent_kinematics"].float()
 
@@ -506,7 +739,7 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
         grid = observations["occupancy_grid"].float()
         agent_kin = observations["agent_kinematics"].float()
 
-        scene_embed = self.vit(grid)
+        scene_embed, _ = self.vit(grid)
         disc_logits = self.discriminator(scene_embed, agent_kin)
         disc_probs = torch.sigmoid(disc_logits)
         anomaly = 1.0 - disc_probs
