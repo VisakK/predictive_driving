@@ -390,6 +390,9 @@ class AnomalyAttentionEncoder(nn.Module):
         grid_h: int = 11,
         grid_w: int = 11,
         use_risk_attention_bias: bool = False,
+        use_per_slot_gru: bool = False,
+        gru_hidden: int = 32,
+        kin_history_feat_dim: int | None = None,
     ):
         super().__init__()
         self.n_agents = n_agents
@@ -398,8 +401,22 @@ class AnomalyAttentionEncoder(nn.Module):
         self.grid_h = grid_h
         self.grid_w = grid_w
         self.use_risk_attention_bias = use_risk_attention_bias
+        self.use_per_slot_gru = use_per_slot_gru
+        self.gru_hidden = gru_hidden
 
-        self.token_proj = nn.Linear(kin_feat_dim + anomaly_feat_dim, embed_dim)
+        token_in_dim = kin_feat_dim + anomaly_feat_dim
+        if self.use_per_slot_gru:
+            hist_feat_dim = (
+                kin_history_feat_dim if kin_history_feat_dim is not None else kin_feat_dim
+            )
+            self.per_slot_gru = nn.GRU(
+                input_size=hist_feat_dim,
+                hidden_size=gru_hidden,
+                num_layers=1,
+                batch_first=True,
+            )
+            token_in_dim += gru_hidden
+        self.token_proj = nn.Linear(token_in_dim, embed_dim)
         self.slot_pos_emb = nn.Parameter(torch.zeros(1, n_agents, embed_dim))
 
         self_attn_layer = nn.TransformerEncoderLayer(
@@ -460,12 +477,24 @@ class AnomalyAttentionEncoder(nn.Module):
         agent_kin: torch.Tensor,        # (B, N, kin_feat_dim)
         agent_anom: torch.Tensor,       # (B, N, anomaly_feat_dim)
         scene_patches: torch.Tensor,    # (B, H*W, scene_dim)
+        agent_kin_history: torch.Tensor | None = None,  # (B, N, T, hist_feat_dim)
     ) -> torch.Tensor:
         B, N, _ = agent_kin.shape
         presence = agent_kin[:, :, 0]                  # (B, N)
         pad_mask = presence < 0.5                      # True = ignore
 
-        token_in = torch.cat([agent_kin, agent_anom], dim=-1)
+        token_parts = [agent_kin, agent_anom]
+        if self.use_per_slot_gru:
+            assert agent_kin_history is not None, (
+                "AnomalyAttentionEncoder.use_per_slot_gru requires agent_kin_history"
+            )
+            T = agent_kin_history.shape[2]
+            F_h = agent_kin_history.shape[3]
+            flat = agent_kin_history.reshape(B * N, T, F_h)
+            _, h = self.per_slot_gru(flat)             # (1, B*N, gru_hidden)
+            temporal = h[-1].reshape(B, N, self.gru_hidden)
+            token_parts.append(temporal)
+        token_in = torch.cat(token_parts, dim=-1)
         agent_tokens = self.token_proj(token_in) + self.slot_pos_emb
 
         # Stage B — agent self-attention.
@@ -538,6 +567,8 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
         anomaly_attn_n_heads: int = 4,
         anomaly_attn_spatial_sigma: float = 1.5,
         anomaly_attn_use_risk_bias: bool = False,
+        anomaly_attn_use_per_slot_gru: bool = False,
+        anomaly_attn_gru_hidden: int = 32,
     ):
         self.use_kinematics_policy = use_kinematics_policy and (
             "agent_kin_history" in observation_space.spaces
@@ -546,6 +577,16 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
             "agent_anomaly" in observation_space.spaces
             and "agent_kinematics" in observation_space.spaces
         )
+        self.anomaly_attn_use_per_slot_gru = (
+            anomaly_attn_use_per_slot_gru
+            and self.use_anomaly_attention_policy
+            and ("agent_kin_history" in observation_space.spaces)
+        )
+        if anomaly_attn_use_per_slot_gru and not self.anomaly_attn_use_per_slot_gru:
+            raise ValueError(
+                "anomaly_attn_use_per_slot_gru=True requires "
+                "use_anomaly_attention_policy=True and 'agent_kin_history' in obs"
+            )
         # Attention policy supersedes the flat-MLP anomaly path.
         self.use_anomaly_policy = (
             use_anomaly_policy
@@ -627,6 +668,11 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
         if self.use_anomaly_attention_policy:
             anom_dim = observation_space["agent_anomaly"].shape[-1]
             kin_dim = observation_space["agent_kinematics"].shape[-1]
+            hist_feat_dim = (
+                observation_space["agent_kin_history"].shape[-1]
+                if self.anomaly_attn_use_per_slot_gru
+                else None
+            )
             self.anomaly_attn_encoder = AnomalyAttentionEncoder(
                 n_agents=n_agents,
                 kin_feat_dim=kin_dim,
@@ -638,6 +684,9 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
                 grid_h=grid_h,
                 grid_w=grid_w,
                 use_risk_attention_bias=anomaly_attn_use_risk_bias,
+                use_per_slot_gru=self.anomaly_attn_use_per_slot_gru,
+                gru_hidden=anomaly_attn_gru_hidden,
+                kin_history_feat_dim=hist_feat_dim,
             )
 
         self._cached_scene_embed: torch.Tensor | None = None
@@ -654,8 +703,15 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
         if self.use_anomaly_attention_policy:
             agent_kin = observations["agent_kinematics"].float()
             agent_anom = observations["agent_anomaly"].float()
+            agent_kin_history = (
+                observations["agent_kin_history"].float()
+                if self.anomaly_attn_use_per_slot_gru
+                else None
+            )
             features.append(
-                self.anomaly_attn_encoder(agent_kin, agent_anom, scene_patches)
+                self.anomaly_attn_encoder(
+                    agent_kin, agent_anom, scene_patches, agent_kin_history
+                )
             )
         elif self.use_anomaly_policy:
             anomaly = observations["agent_anomaly"].float()

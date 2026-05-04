@@ -196,6 +196,12 @@ def run(config_path: str, run_name: str, smoke: bool = False):
             "anomaly_attn_use_risk_bias": adv_cfg.get(
                 "anomaly_attn_use_risk_bias", False
             ),
+            "anomaly_attn_use_per_slot_gru": adv_cfg.get(
+                "anomaly_attn_use_per_slot_gru", False
+            ),
+            "anomaly_attn_gru_hidden": adv_cfg.get(
+                "anomaly_attn_gru_hidden", 32
+            ),
         },
         "net_arch": dict(pi=[128, 128], vf=[128, 128]),
     }
