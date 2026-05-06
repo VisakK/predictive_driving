@@ -105,13 +105,17 @@ class AdversarialPPO(PPO):
             if isinstance(self.action_space, spaces.Discrete):
                 actions = actions.reshape(-1, 1)
 
-            # Anomaly reward shaping
+            # Anomaly reward shaping. Mask terminal transitions: after a step
+            # with done=True, SB3 VecEnv replaces new_obs with the reset state,
+            # so anomaly there is meaningless and (worse) lets crash steps escape
+            # the per-step penalty — creating an early-termination incentive.
             if self.anomaly_reward_weight > 0 and self.num_timesteps > 2048:
                 with th.no_grad():
                     new_obs_t = obs_as_tensor(new_obs, self.device)
                     extractor = self._get_extractor()
                     anomaly = extractor.compute_anomaly_scores(new_obs_t)
-                    rewards = rewards - self.anomaly_reward_weight * anomaly.cpu().numpy()
+                    not_done = (~np.asarray(dones, dtype=bool)).astype(np.float32)
+                    rewards = rewards - self.anomaly_reward_weight * anomaly.cpu().numpy() * not_done
 
             for idx, done in enumerate(dones):
                 if (

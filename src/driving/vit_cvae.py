@@ -775,6 +775,14 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
         self, observations: dict[str, torch.Tensor]
     ) -> torch.Tensor:
         """Per-env anomaly score for reward shaping (higher = more anomalous)."""
+        # Per-env score is the top-3 mean of presence-masked risks. Mean-over-15
+        # dilutes a single high-risk threat by the surrounding nominal slots
+        # (the failure that motivated this change). Pure max() concentrates
+        # correctly but is too spiky — single-step jumps in the per-env penalty
+        # blow up advantage variance and destabilize PPO (we observed that
+        # path: 058's first run NaN'd at iter 21 with approx_kl ≈ 0.047 and
+        # clip_fraction ≈ 0.38). Top-3 mean splits the difference: still
+        # concentrates on threats, but smooths over single-agent spikes.
         if self.use_learned_anomaly_policy and "agent_kin_history" in observations:
             kin_hist = observations["agent_kin_history"].float()
             current = observations["agent_kinematics"].float()
@@ -784,13 +792,13 @@ class ViTCVAEExtractor(BaseFeaturesExtractor):
             )
             presence = anomaly_features[:, :, 0]
             risk = anomaly_features[:, :, 2]
-            return (risk * presence).sum(1) / presence.sum(1).clamp(min=1)
+            return (risk * presence).topk(3, dim=1).values.mean(dim=1)
 
         if "agent_anomaly" in observations:
             anomaly_features = observations["agent_anomaly"].float()
             presence = anomaly_features[:, :, 0]
             risk = anomaly_features[:, :, 2]
-            return (risk * presence).sum(1) / presence.sum(1).clamp(min=1)
+            return (risk * presence).topk(3, dim=1).values.mean(dim=1)
 
         grid = observations["occupancy_grid"].float()
         agent_kin = observations["agent_kinematics"].float()
