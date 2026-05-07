@@ -218,6 +218,8 @@ def run(config_path: str, run_name: str, smoke: bool = False):
         alpha=adv_cfg.get("alpha", 0.1),
         beta=adv_cfg.get("beta", 0.1),
         anomaly_reward_weight=adv_cfg.get("anomaly_reward_weight", 0.5),
+        pbs_weight=adv_cfg.get("pbs_weight", 0.0),
+        truncation_bonus_weight=adv_cfg.get("truncation_bonus_weight", 0.0),
         predictor_loss_weight=adv_cfg.get("predictor_loss_weight", 0.0),
         seed=cfg["seed"],
         tensorboard_log=cfg["tb_dir"],
@@ -263,7 +265,9 @@ def run(config_path: str, run_name: str, smoke: bool = False):
         f.write(f"- Seed: {cfg['seed']}\n")
         f.write(f"- Alpha (CVAE): {adv_cfg.get('alpha', 0.1)}\n")
         f.write(f"- Beta (Disc): {adv_cfg.get('beta', 0.1)}\n")
-        f.write(f"- Anomaly reward weight: {adv_cfg.get('anomaly_reward_weight', 0.5)}\n\n")
+        f.write(f"- Anomaly reward weight: {adv_cfg.get('anomaly_reward_weight', 0.5)}\n")
+        f.write(f"- PBS weight: {adv_cfg.get('pbs_weight', 0.0)}\n")
+        f.write(f"- Truncation bonus weight: {adv_cfg.get('truncation_bonus_weight', 0.0)}\n\n")
         f.write(f"- Predictor loss weight: {adv_cfg.get('predictor_loss_weight', 0.0)}\n")
         f.write(f"- Anomaly policy input: {adv_cfg.get('use_anomaly_policy', False)}\n")
         f.write(f"- Learned anomaly policy input: {adv_cfg.get('use_learned_anomaly_policy', False)}\n\n")

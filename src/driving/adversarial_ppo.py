@@ -39,14 +39,21 @@ class AdversarialPPO(PPO):
         alpha: float = 0.1,
         beta: float = 0.1,
         anomaly_reward_weight: float = 0.5,
+        pbs_weight: float = 0.0,
+        truncation_bonus_weight: float = 0.0,
         predictor_loss_weight: float = 0.0,
         **kwargs,
     ):
         self.alpha = alpha
         self.beta = beta
         self.anomaly_reward_weight = anomaly_reward_weight
+        self.pbs_weight = pbs_weight
+        self.truncation_bonus_weight = truncation_bonus_weight
         self.predictor_loss_weight = predictor_loss_weight
         super().__init__(policy, env, **kwargs)
+        # Per-env PBS and truncation-bonus state, lazy-init in collect_rollouts.
+        self._prev_anomaly_score: np.ndarray | None = None
+        self._episode_max_risk: np.ndarray | None = None
 
     def _get_extractor(self) -> ViTCVAEExtractor:
         extractor = self.policy.features_extractor
@@ -105,17 +112,50 @@ class AdversarialPPO(PPO):
             if isinstance(self.action_space, spaces.Discrete):
                 actions = actions.reshape(-1, 1)
 
-            # Anomaly reward shaping. Mask terminal transitions: after a step
-            # with done=True, SB3 VecEnv replaces new_obs with the reset state,
-            # so anomaly there is meaningless and (worse) lets crash steps escape
-            # the per-step penalty — creating an early-termination incentive.
-            if self.anomaly_reward_weight > 0 and self.num_timesteps > 2048:
+            # Anomaly-derived reward shaping. Three independent paths can fire:
+            #   - anomaly_reward_weight: per-step penalty −w·ρ(s'). 057's design.
+            #   - pbs_weight: potential-based shaping +w·F(s,s') with Φ=−ρ.
+            #     F = ρ(s) − γ·ρ(s'); positive when risk drops, negative when it
+            #     rises, zero in nominal states. Policy-invariant by Ng et al. 1999.
+            #   - truncation_bonus_weight: +w·max_risk_seen at end of episode if
+            #     truncated (not crashed). Rewards "navigated through danger".
+            # All paths mask terminal transitions because SB3 VecEnv replaces
+            # new_obs with the reset state on done.
+            need_anomaly = (
+                self.anomaly_reward_weight > 0
+                or self.pbs_weight > 0
+                or self.truncation_bonus_weight > 0
+            ) and self.num_timesteps > 2048
+            if need_anomaly:
+                if self._prev_anomaly_score is None:
+                    self._prev_anomaly_score = np.zeros(env.num_envs, dtype=np.float32)
+                    self._episode_max_risk = np.zeros(env.num_envs, dtype=np.float32)
                 with th.no_grad():
                     new_obs_t = obs_as_tensor(new_obs, self.device)
                     extractor = self._get_extractor()
-                    anomaly = extractor.compute_anomaly_scores(new_obs_t)
-                    not_done = (~np.asarray(dones, dtype=bool)).astype(np.float32)
-                    rewards = rewards - self.anomaly_reward_weight * anomaly.cpu().numpy() * not_done
+                    curr_anomaly = extractor.compute_anomaly_scores(new_obs_t).cpu().numpy()
+                not_done = (~np.asarray(dones, dtype=bool)).astype(np.float32)
+
+                if self.anomaly_reward_weight > 0:
+                    rewards = rewards - self.anomaly_reward_weight * curr_anomaly * not_done
+
+                if self.pbs_weight > 0:
+                    # F(s, s') = ρ(s) − γ·ρ(s') for Φ = −ρ.
+                    # _prev_anomaly_score holds ρ(s); curr_anomaly holds ρ(s').
+                    pbs_shaping = self._prev_anomaly_score - self.gamma * curr_anomaly
+                    rewards = rewards + self.pbs_weight * pbs_shaping * not_done
+
+                if self.truncation_bonus_weight > 0:
+                    self._episode_max_risk = np.maximum(self._episode_max_risk, curr_anomaly)
+                    for idx, done in enumerate(dones):
+                        if done:
+                            if infos[idx].get("TimeLimit.truncated", False):
+                                rewards[idx] += self.truncation_bonus_weight * self._episode_max_risk[idx]
+                            self._episode_max_risk[idx] = 0.0
+
+                # Update prev for next step. Zero on done so the next episode
+                # starts with Φ(initial) := 0 (standard PBS convention).
+                self._prev_anomaly_score = curr_anomaly * not_done
 
             for idx, done in enumerate(dones):
                 if (
