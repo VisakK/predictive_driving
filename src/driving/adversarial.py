@@ -30,6 +30,120 @@ class AdversarialIDMVehicle(IDMVehicle):
         self.is_adversarial = True
 
 
+class CutInIDMVehicle(IDMVehicle):
+    """Adversarial IDM that deliberately cuts in front of the ego.
+
+    Triggers a forced ``target_lane_index = ego.lane_index`` (bypassing MOBIL
+    safety) when:
+      - ego is in a side lane reachable from this vehicle's current lane,
+      - ego is *behind* this vehicle within ``EGO_DETECTION_RANGE_LON``
+        (in self frame; we cut in front of someone we're already ahead of),
+      - ego is laterally within ``EGO_DETECTION_RANGE_LAT``,
+      - the ego is not pulling away (component of ego velocity along self
+        heading minus self speed >= ``EGO_CLOSING_THRESHOLD``),
+      - ``_cooldown_steps`` has elapsed since the last cut-in.
+
+    Once triggered, the target lane is held for ``COMMIT_STEPS`` so the lane
+    change can complete even if conditions briefly stop matching, then a
+    cooldown begins. The longitudinal IDM controller stays nominal so the
+    vehicle does not crash into its own leader.
+
+    Time bookkeeping uses sim-step counts (one decrement per
+    ``change_lane_policy`` call); at the standard simulation_frequency=5,
+    one step ≈ 0.2s of real time.
+    """
+
+    ARCHETYPE = "cut_in"
+
+    EGO_DETECTION_RANGE_LON = 25.0  # [m]
+    EGO_DETECTION_RANGE_LAT = 6.0   # [m]
+    EGO_CLOSING_THRESHOLD = -1.0    # [m/s]: ego_v_along - self_v >= this
+    COOLDOWN_STEPS = 25             # ~5s at sim_freq=5Hz
+    COMMIT_STEPS = 10               # ~2s at sim_freq=5Hz
+
+    POLITENESS = 0.0
+    LANE_CHANGE_MIN_ACC_GAIN = 0.0
+    LANE_CHANGE_MAX_BRAKING_IMPOSED = 4.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_adversarial = True
+        self.archetype = self.ARCHETYPE
+        self._cooldown_steps = 0
+        self._commit_steps = 0
+        self._committed_target_lane = None
+
+    def _randomize_archetype(self, rng) -> None:
+        # Stagger initial cooldowns so cut-ins from different vehicles don't
+        # synchronously fire at the first opportunity.
+        self._cooldown_steps = int(rng.integers(0, self.COOLDOWN_STEPS + 1))
+
+    def _ego(self):
+        for v in self.road.vehicles:
+            if isinstance(v, ControlledVehicle) and not getattr(v, "is_adversarial", False):
+                return v
+        return None
+
+    def _ego_target_lane(self):
+        """Return the ego's lane_index if cut-in conditions are met, else None."""
+        ego = self._ego()
+        if ego is None:
+            return None
+        if ego.lane_index == self.lane_index:
+            return None
+        try:
+            side_lanes = list(self.road.network.side_lanes(self.lane_index))
+        except Exception:
+            return None
+        if ego.lane_index not in side_lanes:
+            return None
+
+        dx_world = float(ego.position[0] - self.position[0])
+        dy_world = float(ego.position[1] - self.position[1])
+        cos_h = float(np.cos(self.heading))
+        sin_h = float(np.sin(self.heading))
+        dx = cos_h * dx_world + sin_h * dy_world  # +x ahead of self
+        dy = -sin_h * dx_world + cos_h * dy_world
+
+        # Ego must be behind us (we cut in front of someone catching up).
+        if dx > 0:
+            return None
+        if dx < -self.EGO_DETECTION_RANGE_LON:
+            return None
+        if abs(dy) > self.EGO_DETECTION_RANGE_LAT:
+            return None
+
+        v_self = float(self.speed)
+        v_ego_along = float(ego.speed * np.cos(ego.heading - self.heading))
+        if (v_ego_along - v_self) < self.EGO_CLOSING_THRESHOLD:
+            return None
+
+        return ego.lane_index
+
+    def change_lane_policy(self) -> None:
+        if self._cooldown_steps > 0:
+            self._cooldown_steps -= 1
+        if self._commit_steps > 0:
+            self._commit_steps -= 1
+
+        # While committed to a cut-in, hold the target so the lane change
+        # completes even if the ego briefly drops out of the trigger zone.
+        if self._commit_steps > 0 and self._committed_target_lane is not None:
+            self.target_lane_index = self._committed_target_lane
+            return
+
+        if self._cooldown_steps <= 0:
+            target = self._ego_target_lane()
+            if target is not None:
+                self.target_lane_index = target
+                self._committed_target_lane = target
+                self._commit_steps = self.COMMIT_STEPS
+                self._cooldown_steps = self.COOLDOWN_STEPS + self.COMMIT_STEPS
+                return
+
+        super().change_lane_policy()
+
+
 class AdversarialHighwayEnv(HighwayEnv):
     """Highway env injecting ~15% adversarial agents into traffic."""
 

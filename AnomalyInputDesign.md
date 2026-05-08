@@ -2338,4 +2338,61 @@ the two ambitious next horizons — E targets the one regression in
 directions that would only become priorities after the basics from
 A–D have shipped.
 
+---
+
+## Open environment-design questions (post 050–059 results review)
+
+Reviewing rollout videos from the V3-trained policies (ViT-only/051,
+AnomAttn/052, AnomAttn-Risk-GRU/054) surfaces a behavioral pattern:
+the ego drives slowly, refuses to close on leaders, and uses the
+SLOWER action far more often than FASTER. Reward numbers back this
+up — adversarial-trained models score ~8–9 vs the baseline's ~20.
+Several environment-design choices are worth revisiting:
+
+**1. Action space is too coarse.** All current experiments use
+`DiscreteMetaAction` (LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER),
+inherited from HighwayEnv defaults. The policy can only nudge target
+speed in 5 m/s increments and lane changes are dispatched to a
+controller — there is no continuous steering or throttle. To really
+see the policy *react* to nearby agents (slipping past a tailgater,
+nudging laterally to dodge a cut-in, smoothly modulating speed
+around a sudden-braker), we likely need
+`ContinuousAction` (throttle ∈ [-1, 1], steering ∈ [-π/4, π/4]).
+Discrete actions force the conservatism we observed: when the only
+"slow down a little" option is a 5 m/s drop, repeatedly picking
+SLOWER and never picking FASTER is the locally optimal behavior.
+
+**2. Reward should include a target-speed term.** HighwayEnv's
+reward is dominated by `high_speed_reward`, but on the highway env
+we should be explicit about what "good driving" means — sustaining
+~25–30 m/s while staying safe, not collapsing to the lowest legal
+speed because slow + no crash beats fast + occasional crash. A
+target-speed band reward (peaked at e.g. 28 m/s, decaying as the
+ego deviates above or below) would penalize both reckless speeding
+*and* the over-cautious crawling we currently observe. This is
+particularly important for highway evaluation; merge/intersection
+envs may need different shaping.
+
+**3. Adversarial-vs-nominal ratio is up for debate.** The current
+config injects 15% adversarial agents globally with
+`N_FORCED_NEAR=3` in `NEAR_POOL_SIZE=8`, which guarantees ~37%
+*local* adversarial density in the ego's vicinity. The policy has
+correctly learned "near = dangerous" because in training, near
+*was* dangerous more often than not. Open questions:
+- Is 15% the right global ratio, or should it be lower (5–10%) to
+  match a more realistic threat distribution?
+- Is the proximity guarantee (`N_FORCED_NEAR=3`) doing more harm
+  than good now that the policies have a working anomaly channel
+  (PBS, risk-temp)? A weaker guarantee might let the policy learn
+  to discriminate dangerous from benign neighbors instead of
+  treating proximity itself as the threat.
+- What should the ratio be at *evaluation* time vs *training* time?
+  Mismatched ratios are a legitimate part of a generalization
+  study, but we currently use 15% for both.
+
+These three threads are independent of the anomaly-channel design
+this document focuses on, but they bound the ceiling on what any
+anomaly-aware policy can demonstrate. Worth resolving before the
+next round of architectural ablations.
+
 

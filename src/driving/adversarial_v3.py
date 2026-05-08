@@ -23,6 +23,7 @@ from highway_env.vehicle.kinematics import Vehicle
 
 from driving.adversarial import (
     AdversarialHighwayV2Env,
+    CutInIDMVehicle,
     DictObsWrapper,
     HorizonExpectedObservedDictObsWrapper,
     KinHistoryDictObsWrapper,
@@ -271,6 +272,7 @@ ARCHETYPE_REGISTRY = {
     "sudden_braker": SuddenBrakerVehicle,
     "lane_drifter": LaneDrifterVehicle,
     "erratic_speed": ErraticSpeedVehicle,
+    "cut_in": CutInIDMVehicle,  # added for V4 OOD eval; not in V3 default mixture
 }
 
 DEFAULT_ARCHETYPE_WEIGHTS = {
@@ -278,6 +280,21 @@ DEFAULT_ARCHETYPE_WEIGHTS = {
     "sudden_braker": 0.20,
     "lane_drifter": 0.20,
     "erratic_speed": 0.20,
+}
+
+# V4 OOD mixtures: cut_in is a held-out adversary that no V3-trained model
+# has seen. V4_MIXED replaces erratic_speed with cut_in to keep total
+# adversary count and three of the four familiar archetypes intact.
+# V4_PURE_CUTIN sets every adversarial slot to cut_in for a maximal stress test.
+V4_MIXED_WEIGHTS = {
+    "tailgater": 0.40,
+    "sudden_braker": 0.20,
+    "lane_drifter": 0.20,
+    "cut_in": 0.20,
+}
+
+V4_PURE_CUTIN_WEIGHTS = {
+    "cut_in": 1.0,
 }
 
 
@@ -298,6 +315,10 @@ def _convert_to_archetype(
     elif archetype == "erratic_speed":
         vehicle._next_switch_time = 0.0
         vehicle._sim_time = 0.0
+    elif archetype == "cut_in":
+        vehicle._cooldown_steps = 0
+        vehicle._commit_steps = 0
+        vehicle._committed_target_lane = None
     randomize_archetype(vehicle, rng)
 
 
@@ -497,6 +518,39 @@ def make_adversarial_highway_v3_dict(**kwargs):
     return DictObsWrapperV3(env)
 
 
+# ---------------------------------------------------------------------------
+# V4 OOD factories (cut_in archetype) — same env machinery, different mixture.
+# ---------------------------------------------------------------------------
+
+
+def make_adversarial_highway_v4_mixed_h10(**kwargs):
+    kwargs.pop("archetype_weights", None)
+    env = AdversarialHighwayV3Env(**kwargs)
+    env.config["archetype_weights"] = dict(V4_MIXED_WEIGHTS)
+    return HorizonExpectedObservedDictObsWrapperV3(env, horizon=10)
+
+
+def make_adversarial_highway_v4_pure_cutin_h10(**kwargs):
+    kwargs.pop("archetype_weights", None)
+    env = AdversarialHighwayV3Env(**kwargs)
+    env.config["archetype_weights"] = dict(V4_PURE_CUTIN_WEIGHTS)
+    return HorizonExpectedObservedDictObsWrapperV3(env, horizon=10)
+
+
+def make_adversarial_highway_v4_mixed_dict(**kwargs):
+    kwargs.pop("archetype_weights", None)
+    env = AdversarialHighwayV3Env(**kwargs)
+    env.config["archetype_weights"] = dict(V4_MIXED_WEIGHTS)
+    return DictObsWrapperV3(env)
+
+
+def make_adversarial_highway_v4_pure_cutin_dict(**kwargs):
+    kwargs.pop("archetype_weights", None)
+    env = AdversarialHighwayV3Env(**kwargs)
+    env.config["archetype_weights"] = dict(V4_PURE_CUTIN_WEIGHTS)
+    return DictObsWrapperV3(env)
+
+
 gym.register(
     id="adversarial-highway-v3-h10",
     entry_point="driving.adversarial_v3:make_adversarial_highway_v3_h10",
@@ -508,4 +562,20 @@ gym.register(
 gym.register(
     id="adversarial-highway-v3-dict",
     entry_point="driving.adversarial_v3:make_adversarial_highway_v3_dict",
+)
+gym.register(
+    id="adversarial-highway-v4-mixed-h10",
+    entry_point="driving.adversarial_v3:make_adversarial_highway_v4_mixed_h10",
+)
+gym.register(
+    id="adversarial-highway-v4-pure-cutin-h10",
+    entry_point="driving.adversarial_v3:make_adversarial_highway_v4_pure_cutin_h10",
+)
+gym.register(
+    id="adversarial-highway-v4-mixed-dict",
+    entry_point="driving.adversarial_v3:make_adversarial_highway_v4_mixed_dict",
+)
+gym.register(
+    id="adversarial-highway-v4-pure-cutin-dict",
+    entry_point="driving.adversarial_v3:make_adversarial_highway_v4_pure_cutin_dict",
 )
