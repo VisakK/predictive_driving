@@ -124,9 +124,13 @@ def evaluate_adversarial(
     return metrics
 
 
-def run(config_path: str, run_name: str, smoke: bool = False):
+def run(config_path: str, run_name: str, smoke: bool = False,
+        device_override: str | None = None):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+
+    if device_override is not None:
+        cfg["device"] = device_override
 
     adv_cfg = cfg.get("adversarial_config", {})
 
@@ -224,7 +228,7 @@ def run(config_path: str, run_name: str, smoke: bool = False):
         seed=cfg["seed"],
         tensorboard_log=cfg["tb_dir"],
         verbose=cfg.get("verbose", 1),
-        device="cpu",
+        device=cfg.get("device", "auto"),
         policy_kwargs=policy_kwargs,
         **algo_kwargs,
     )
@@ -289,5 +293,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--run_name", type=str, default="adversarial_run")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Override device (cpu/cuda/auto). Defaults to cfg.device or 'auto'.")
     args = parser.parse_args()
-    run(args.config, args.run_name, args.smoke)
+    run(args.config, args.run_name, args.smoke, device_override=args.device)

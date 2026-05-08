@@ -80,9 +80,12 @@ def evaluate_and_log(model, env_id: str, n_episodes: int = 50,
     print(f"Logged evaluation metrics")
     return metrics
 
-def run(config_path: str, run_name: str, smoke: bool = False):
+def run(config_path: str, run_name: str, smoke: bool = False,
+        device_override: str | None = None):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+    if device_override is not None:
+        cfg["device"] = device_override
 
     run = wandb.init(project="predictive_driving",
                 name=run_name,
@@ -103,7 +106,8 @@ def run(config_path: str, run_name: str, smoke: bool = False):
         algo_kwargs["n_steps"] = 128
         algo_kwargs.setdefault("batch_size", 64)
     model = AlgoCls(cfg["policy"], env, seed=cfg["seed"],
-                    tensorboard_log=cfg["tb_dir"], verbose=cfg.get("verbose", 1), device="cpu", **algo_kwargs)
+                    tensorboard_log=cfg["tb_dir"], verbose=cfg.get("verbose", 1),
+                    device=cfg.get("device", "auto"), **algo_kwargs)
     model.learn(total_timesteps=timesteps, callback=WandbCallback(model_save_path=f"{cfg['model_path']}/{run.id}",
         verbose=cfg.get("verbose", 1)),progress_bar=True)
     model.save(cfg["model_path"])
@@ -124,5 +128,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="configs/ppo.yaml")
     parser.add_argument("--run_name", type=str, default="ppo_run")
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Override device (cpu/cuda/auto). Defaults to cfg.device or 'auto'.")
     args = parser.parse_args()
-    run(args.config, args.run_name, args.smoke)
+    run(args.config, args.run_name, args.smoke, device_override=args.device)
