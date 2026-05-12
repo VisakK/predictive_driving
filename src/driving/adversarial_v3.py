@@ -263,6 +263,39 @@ class ErraticSpeedVehicle(IDMVehicle):
 
 
 # ---------------------------------------------------------------------------
+# Archetype 5 — RearEnder
+# ---------------------------------------------------------------------------
+
+
+class RearEnderVehicle(IDMVehicle):
+    """Approaches the ego from behind at a persistent high closing speed.
+
+    Behavior comes from three knobs on top of IDM, not a state machine:
+      - very small headway (TIME_WANTED, DISTANCE_WANTED) so it tucks
+        in tightly behind the ego instead of falling back,
+      - weak comfort braking (COMFORT_ACC_MIN) so it doesn't politely
+        slow down when it gets near,
+      - target_speed is set *externally* at spawn to ego_speed + delta
+        (caller's responsibility), giving a maintained closing rate.
+
+    Lane changes are suppressed by an unreachably high MIN_ACC_GAIN.
+    """
+
+    ARCHETYPE = "rear_ender"
+
+    TIME_WANTED = 0.3
+    DISTANCE_WANTED = 1.0 + ControlledVehicle.LENGTH
+    COMFORT_ACC_MAX = 6.0
+    COMFORT_ACC_MIN = -2.0
+    POLITENESS = 0.0
+    LANE_CHANGE_MIN_ACC_GAIN = 100.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        mark_adversarial(self, self.ARCHETYPE)
+
+
+# ---------------------------------------------------------------------------
 # Archetype dispatch
 # ---------------------------------------------------------------------------
 
@@ -272,6 +305,7 @@ ARCHETYPE_REGISTRY = {
     "sudden_braker": SuddenBrakerVehicle,
     "lane_drifter": LaneDrifterVehicle,
     "erratic_speed": ErraticSpeedVehicle,
+    "rear_ender": RearEnderVehicle,
     "cut_in": CutInIDMVehicle,  # added for V4 OOD eval; not in V3 default mixture
 }
 

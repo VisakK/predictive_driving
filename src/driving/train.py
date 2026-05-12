@@ -5,6 +5,11 @@ import wandb
 from wandb.integration.sb3 import WandbCallback
 import highway_env  # noqa: F401 — registers envs
 import driving.envs  # noqa: F401 — registers custom envs
+import driving.adversarial  # noqa: F401 — registers adversarial envs
+import driving.adversarial_v3  # noqa: F401 — registers V3 adversarial envs
+import driving.adversarial_v3_ts  # noqa: F401 — registers V3-ts (target-speed) envs
+import driving.adversarial_v3i  # noqa: F401 — registers V3i (interaction) envs
+import driving.baseline_continuous  # noqa: F401 — registers continuous-action baseline
 from stable_baselines3 import PPO, SAC, DQN
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv

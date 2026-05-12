@@ -18,6 +18,8 @@ import highway_env  # noqa: F401
 import driving.envs  # noqa: F401
 import driving.adversarial  # noqa: F401 — registers adversarial envs
 import driving.adversarial_v3  # noqa: F401 — registers v3 archetype envs
+import driving.adversarial_v3_ts  # noqa: F401 — registers v3-ts target-speed envs
+import driving.adversarial_v3i  # noqa: F401 — registers v3i interaction envs
 
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv

@@ -2395,4 +2395,52 @@ this document focuses on, but they bound the ceiling on what any
 anomaly-aware policy can demonstrate. Worth resolving before the
 next round of architectural ablations.
 
+---
+
+## Update (2026-05-08): policies were *evading* adversaries, not engaging them
+
+Watching rollout videos from the v3-ts retrained models (061–064:
+DiscreteMetaAction, 150k steps, target-speed reward, N_FORCED_NEAR=1)
+revealed a behavior pattern that defeats the entire premise of this
+research: the policies drift to lane 0 or lane 3 and stay there.
+That gives a passive equilibrium — half the lateral threat surface
+(only one neighboring lane) and a free `right_lane_reward = 0.1`
+from highway-env's defaults — without ever needing to interact with
+the adversaries the research is meant to study.
+
+**The goal isn't safe driving in general; it's safe maneuvering in
+the presence of an adversarial agent.** Hiding from adversaries
+trivially achieves the wrong objective.
+
+Two structural fixes applied to `TargetSpeedV3HighwayEnv`
+(`src/driving/adversarial_v3_ts.py`) for the next round of training:
+
+**1. `right_lane_reward = 0`.** highway-env's default of 0.1 was
+designed for a generic right-hand-lane highway-driving objective and
+explicitly rewards camping at the rightmost lane. That bonus has
+nothing to do with adversarial-agent safety, and it was paying the
+policy to ignore the actual research signal. Set to 0 in
+``default_config``.
+
+**2. Lane-biased adversarial spawning (`LANE_BIAS_FRACTION = 0.8`).**
+The `_create_vehicles` override partitions the nominal pool into
+``ego_lane ± 1`` ("near") and the rest ("far"), then spawns 80% of
+adversaries in the near pool and 20% in the far pool. The near pool
+still uses the proximity guarantee (`N_FORCED_NEAR = 1` in the
+`NEAR_POOL_SIZE = 8` nearest). This means hiding in lane 0 or 3
+no longer evades adversaries — they follow the ego's lane. The
+20% far-pool fraction preserves enough naturalistic traffic that the
+env doesn't feel pathological.
+
+Empirical verification (10 seeds): mean 15 adversarial vehicles per
+episode (15% × 100), of which mean 12 are in the ego's lane or an
+adjacent lane (80% target hit exactly), 3 are elsewhere.
+
+The resulting v3-ts env is now *strictly harder* than the original
+v3 env: hiding doesn't work, and the policy must actually reason
+about the adversaries it sees. Crash rates from the 061–064 retrain
+will rise as a result; the interesting comparison is whether
+anomaly-aware models (063, 064) close the gap to the baseline (061)
+more meaningfully than they did under the easier env.
+
 
